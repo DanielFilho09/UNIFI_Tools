@@ -9,3 +9,5 @@ Powershell GUI made easy
 
 [Art of Wifi - Unifi API Client](https://github.com/Art-of-WiFi/UniFi-API-client)
 Well documented API Reference
+- Baixar a pasta Super-Admin e execultar para exclusão de usuarios em massa.
+- E o unifi search para consultar por mac onde o AP está instalado.
