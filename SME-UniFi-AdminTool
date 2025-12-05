@@ -1,0 +1,203 @@
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Application]::EnableVisualStyles()
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+
+# --- UI SETUP ---
+$Form = New-Object system.Windows.Forms.Form
+$Form.ClientSize = '750,550'
+$Form.text = "Unifi Super Admin Remover (v9 - Duplicates Fix)"
+$Form.TopMost = $false
+
+# Inputs
+$LabelU = New-Object system.Windows.Forms.Label; $LabelU.Text="URL:"; $LabelU.Location="15,12"; $LabelU.AutoSize=$true
+$TxtUrl = New-Object system.Windows.Forms.TextBox; $TxtUrl.Width=200; $TxtUrl.Location="50,10"; $TxtUrl.Text='https://unifi.sme.fortaleza.ce.gov.br:8443'
+
+$BtnCred = New-Object system.Windows.Forms.Button; $BtnCred.Text="1. Credenciais"; $BtnCred.Width=100; $BtnCred.Location="260,8"
+$BtnLogin = New-Object system.Windows.Forms.Button; $BtnLogin.Text="2. Logar e Listar"; $BtnLogin.Width=110; $BtnLogin.Location="370,8"; $BtnLogin.Enabled=$false
+
+$LabelS = New-Object system.Windows.Forms.Label; $LabelS.Text="Super Admin Alvo:"; $LabelS.Location="15,50"; $LabelS.AutoSize=$true
+$CmbAdmins = New-Object system.Windows.Forms.ComboBox; $CmbAdmins.Width=250; $CmbAdmins.Location="120,48"
+
+$BtnNuke = New-Object system.Windows.Forms.Button; $BtnNuke.Text="3. REMOVER"; $BtnNuke.Width=100; $BtnNuke.Location="380,46"; $BtnNuke.Enabled=$false; $BtnNuke.BackColor=[System.Drawing.Color]::LightCoral
+
+$Grid = New-Object system.Windows.Forms.DataGridView; $Grid.Width=710; $Grid.Height=200; $Grid.Location="15,80"; $Grid.ReadOnly=$true
+$Grid.ColumnCount=3; $Grid.Columns[0].Name="Admin"; $Grid.Columns[1].Name="Ação"; $Grid.Columns[2].Name="Status"; $Grid.Columns[1].Width=300
+
+$TxtLog = New-Object system.Windows.Forms.TextBox; $TxtLog.Multiline=$true; $TxtLog.ScrollBars="Vertical"; $TxtLog.Width=710; $TxtLog.Height=200; $TxtLog.Location="15,310"
+$TxtLog.BackColor = "Black"; $TxtLog.ForeColor = "Lime"; $TxtLog.Font = "Consolas, 9"
+
+$Form.controls.AddRange(@($LabelU, $TxtUrl, $BtnCred, $BtnLogin, $LabelS, $CmbAdmins, $BtnNuke, $Grid, $TxtLog))
+
+# --- VARIÁVEIS ---
+$script:creds = $null
+$script:GlobalSession = $null
+$script:sites = @()
+$script:admins = @()
+$script:baseurl = ""
+$script:csrf = ""
+
+# --- FUNÇÕES ---
+function Log($msg) {
+    $d = Get-Date -Format "HH:mm:ss"
+    $TxtLog.AppendText("[$d] $msg`r`n")
+    $Form.Refresh() 
+}
+
+$BtnCred.Add_Click({
+    $c = Get-Credential -Message "Login Unifi"
+    if ($c) {
+        $script:creds = @{ username=$c.UserName; password=$c.GetNetworkCredential().Password }
+        $BtnLogin.Enabled = $true
+        $BtnLogin.BackColor = [System.Drawing.Color]::LightGreen
+        Log "Credenciais prontas."
+    }
+})
+
+$BtnLogin.Add_Click({
+    $CmbAdmins.Items.Clear()
+    $Grid.Rows.Clear()
+    $script:baseurl = $TxtUrl.Text.TrimEnd('/')
+    $script:GlobalSession = $null
+    $script:csrf = ""
+    
+    Log "Iniciando v9 (Sanitização)..."
+
+    # 1. SSL Bypass
+    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+        try {
+            add-type @"
+                using System.Net;
+                using System.Security.Cryptography.X509Certificates;
+                public class TrustAllCertsPolicy : ICertificatePolicy {
+                    public bool CheckValidationResult(ServicePoint s, X509Certificate c, WebRequest r, int p) { return true; }
+                }
+"@ 
+        } catch { }
+    }
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+
+    # 2. Login
+    try {
+        Log "POST Login..."
+        $loginRes = Invoke-WebRequest -Uri "$script:baseurl/api/login" -Method Post -Body ($script:creds|ConvertTo-Json) -ContentType "application/json" -SessionVariable "SessaoLocal" -UseBasicParsing
+        
+        $script:GlobalSession = $SessaoLocal
+        
+        # BUSCA CSRF
+        if ($loginRes.Headers['x-csrf-token']) { $script:csrf = $loginRes.Headers['x-csrf-token'] }
+        elseif ($loginRes.Headers['X-CSRF-Token']) { $script:csrf = $loginRes.Headers['X-CSRF-Token'] }
+        
+        if ([string]::IsNullOrEmpty($script:csrf)) {
+            Log "Procurando CSRF nos cookies..."
+            foreach ($cookie in $script:GlobalSession.Cookies.GetCookies($script:baseurl)) {
+                if ($cookie.Name -eq "csrf_token" -or $cookie.Name -eq "X-CSRF-Token") { 
+                    $script:csrf = $cookie.Value 
+                    Log ">> CSRF encontrado no cookie!"
+                }
+            }
+        }
+        Log "Token CSRF: $script:csrf"
+
+        if ($loginRes.StatusCode -eq 200) {
+            # 3. Sites
+            try {
+                # Usa Invoke-WebRequest para pegar texto bruto e evitar erro de parse automático
+                $sitesReq = Invoke-WebRequest -Uri "$script:baseurl/api/self/sites" -WebSession $script:GlobalSession -ContentType "application/json" -UseBasicParsing
+                $sitesJson = $sitesReq.Content
+                
+                # Sanitização preventiva (caso haja duplicados nos sites também)
+                $sitesJson = $sitesJson -creplace '"Downlink":', '"Downlink_Alt":'
+                $sitesJson = $sitesJson -creplace '"Uplink":', '"Uplink_Alt":'
+                
+                $sitesObj = $sitesJson | ConvertFrom-Json
+                $script:sites = $sitesObj.data
+                Log "Sites carregados: $($script:sites.Count)"
+            } catch { Log "Erro sites: $_" }
+
+            # 4. Admins (CORREÇÃO CRÍTICA)
+            Log "Buscando Admins (Raw)..."
+            $headers = @{}
+            if ($script:csrf) { $headers.Add("x-csrf-token", $script:csrf) }
+
+            try {
+                # Força o retorno como Texto Puro usando Invoke-WebRequest
+                $admReq = Invoke-WebRequest -Uri "$script:baseurl/api/stat/admin" -WebSession $script:GlobalSession -Headers $headers -ContentType "application/json" -UseBasicParsing
+                $rawJson = $admReq.Content
+                
+                Log "Dados recebidos. Tamanho: $([math]::Round($rawJson.Length/1KB, 2)) KB"
+                Log "Aplicando sanitização de chaves duplicadas..."
+                
+                # SUBSTITUIÇÃO CASE-SENSITIVE DAS CHAVES PROBLEMÁTICAS
+                # Unifi envia "downlink" e "Downlink" no mesmo objeto, o PowerShell odeia isso.
+                $rawJson = $rawJson -creplace '"Downlink"\s*:', '"Downlink_Alt":'
+                $rawJson = $rawJson -creplace '"Uplink"\s*:', '"Uplink_Alt":'
+                
+                Log "Convertendo JSON..."
+                $admObj = $rawJson | ConvertFrom-Json
+
+                if ($admObj.data) {
+                    $script:admins = $admObj.data | Where-Object { 
+                        $_.is_super -eq $true -or $_.is_super -eq "true" 
+                    }
+                    Log "Sucesso! Total Super Admins: $($script:admins.Count)"
+
+                    foreach ($a in $script:admins) {
+                        $nome = if ($a.email) { $a.email } else { $a.name }
+                        $CmbAdmins.Items.Add($nome)
+                    }
+                    if ($CmbAdmins.Items.Count -gt 0) { 
+                        $CmbAdmins.SelectedIndex = 0 
+                        $BtnNuke.Enabled = $true
+                    }
+                } else {
+                    Log "ERRO: Campo 'data' vazio ou inválido."
+                }
+            } catch {
+                Log "ERRO CRÍTICO (v9): $($_.Exception.Message)"
+            }
+        }
+    } catch {
+        Log "FALHA NO LOGIN: $($_.Exception.Message)"
+    }
+})
+
+$BtnNuke.Add_Click({
+    if ($CmbAdmins.SelectedIndex -lt 0) { return }
+    $alvoNome = $CmbAdmins.SelectedItem
+    
+    $res = [System.Windows.Forms.MessageBox]::Show("Remover status de SUPER ADMIN de: $alvoNome?", "Confirmação", [System.Windows.Forms.MessageBoxButtons]::YesNo)
+    if ($res -eq 'No') { return }
+
+    # Achar ID
+    $alvoObj = $script:admins | Where-Object { ($_.email -eq $alvoNome) -or ($_.name -eq $alvoNome) } | Select-Object -First 1
+    $id = $alvoObj._id
+    
+    $headers = @{}
+    if ($script:csrf) { $headers.Add("x-csrf-token", $script:csrf) }
+
+    # 1. Revogar Super Admin
+    Log "Revogando Super Admin..."
+    try {
+        $body = @{ cmd="revoke-super-admin"; admin=$id } | ConvertTo-Json
+        Invoke-RestMethod -Uri "$script:baseurl/api/s/default/cmd/sitemgr" -Method Post -Body $body -WebSession $script:GlobalSession -Headers $headers -ContentType "application/json"
+        $Grid.Rows.Add($alvoNome, "Revogar Super Admin", "SUCESSO")
+    } catch {
+        $Grid.Rows.Add($alvoNome, "Revogar Super Admin", "FALHA: $($_.Exception.Message)")
+    }
+
+    # 2. Remover dos Sites
+    foreach ($s in $script:sites) {
+        $sName = $s.name
+        $body = @{ cmd="revoke-admin"; admin=$id } | ConvertTo-Json
+        try {
+            Invoke-RestMethod -Uri "$script:baseurl/api/s/$sName/cmd/sitemgr" -Method Post -Body $body -WebSession $script:GlobalSession -Headers $headers -ContentType "application/json"
+            $Grid.Rows.Add($alvoNome, "Site: $($s.desc)", "REMOVIDO")
+        } catch {
+             # Ignora erros silenciosos
+        }
+        $Form.Refresh()
+    }
+    [System.Windows.Forms.MessageBox]::Show("Finalizado!")
+})
+
+[void]$Form.ShowDialog()
