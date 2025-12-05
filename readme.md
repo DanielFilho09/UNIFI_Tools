@@ -3,6 +3,9 @@ This Repository contains Powershell based tools for use with the Unifi Controlle
 
  - [Unifi Super Admin Remover](https://github.com/coolriku/Unifi-Tools/tree/master/Super-admin-Remover)
 
+ - Prezados, essa versão sofreu atualização apartir da v9 do UNIFI;
+ - VOu subir codigo novo;
+
 ## Credits
 [POSHGUI](https://poshgui.com/) 
 Powershell GUI made easy
